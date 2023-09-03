@@ -7,18 +7,20 @@ import pytest
 
 from minjax import lax
 
-DEFAULT_SHAPES = [(), (2,), (2, 3)]
-DEFAULT_INTEGER_DTYPES = [np.int32, np.int64]
-DEFAULT_FLOATING_DTYPES = [np.float32, np.float64]
+DEFAULT_SHAPES = ((), (2,), (2, 3))
+DEFAULT_INTEGER_DTYPES = (np.int32, np.int64)
+DEFAULT_FLOATING_DTYPES = (np.float32, np.float64)
 DEFAULT_DTYPES = DEFAULT_INTEGER_DTYPES + DEFAULT_FLOATING_DTYPES
 
 
-def _create_random_arrays(num, scale, shape, dtype):
+def _create_random_arrays(num, scale, shape, dtype, seed=42):
     args = []
 
+    rng = np.random.default_rng(seed=seed)
+
     for _ in range(num):
-        x = np.random.normal(scale=scale, size=shape).astype(dtype)
-        x = x.item() if x.shape == () else x
+        x = rng.normal(scale=scale, size=shape).astype(dtype)
+        x = dtype(x.item()) if x.shape == () else x
         args.append(x)
 
     return args

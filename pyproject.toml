@@ -37,6 +37,7 @@ Source = "https://github.com/leandrolcampos/minJAX"
 [project.optional-dependencies]
 test = [
   "coverage[toml]>=6.5",
+  "mpmath",
   "pytest",
 ]
 lint = [
@@ -67,8 +68,7 @@ cov = [
 python = ["3.10", "3.11"]
 
 [tool.hatch.envs.lint]
-detached = true
-dependencies = ["minjax[lint]"]
+dependencies = ["minjax[dev]"]
 [tool.hatch.envs.lint.scripts]
 typing = "mypy --install-types --non-interactive {args:src/minjax tests}"
 style = [
