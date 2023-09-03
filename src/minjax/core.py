@@ -2,22 +2,45 @@
 
 import contextlib
 import operator as op
+import typing
 from abc import ABCMeta, abstractmethod
 from collections.abc import Iterator, Sequence
 from typing import Any, Generic, Protocol, TypeVar, Union
 
 import numpy as np
 
-from minjax import lax
+from minjax import dtypes, lax
 
 __all__ = [
+    "ConcreteArray",
+    "get_aval",
+    "new_main",
     "Primitive",
+    "ShapedArray",
+    "Trace",
+    "Tracer",
 ]
+
+# mypy implicitly sets this variable to true when type checking.
+MYPY = False
+
+minjax_types: set[type] = {
+    bool,
+    int,
+    float,
+    np.bool_,
+    np.int32,
+    np.int64,
+    np.float32,
+    np.float64,
+    np.ndarray,
+}
 
 Array = Union[np.ndarray, "Tracer"]
 
-NumpyArrayLike = (
-    bool
+ArrayLike = (
+    Array
+    | bool
     | int
     | float
     | np.bool_
@@ -28,37 +51,40 @@ NumpyArrayLike = (
     | np.ndarray
 )
 
-ArrayLike = Array | NumpyArrayLike
-
-TracerType = TypeVar("TracerType", bound=Array)
+TracerType = TypeVar("TracerType", bound=ArrayLike)
 
 
-class ImplRule(Protocol):
-    def __call__(self, *args: ArrayLike, **params: Any) -> Array | Sequence[Array]:
-        """Impl rule that runs a primitive operation using some interpreter."""
-        ...
+if not MYPY:
+
+    class ImplRule(Protocol):
+        def __call__(self, *args: ArrayLike, **params: Any) -> Sequence[Array]:
+            """Impl rule that runs a primitive operation using some interpreter."""
+            ...
+
+else:
+    ImplRule = Any
 
 
 class Primitive:
     """Represents a primitive operation."""
 
     name: str
-    multiple_results: bool = False
     impl_rule: None | ImplRule = None
 
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def bind(self, *args: ArrayLike, **params: Any) -> Array | Sequence[Array]:
+    def bind1(self, *args: ArrayLike, **params: Any) -> Array:
         top_trace = find_top_trace(args)
-        return self.bind_with_trace(top_trace, args, params)
+        (out,) = self.bind_with_trace(top_trace, args, params)
+        return out
 
     def bind_with_trace(
         self, trace: "Trace", args: Sequence[ArrayLike], params: dict[str, Any]
-    ) -> Array | Sequence[Array]:
-        tracers = map(trace.full_raise, args)
+    ) -> Sequence[Array]:
+        tracers = [trace.full_raise(x) for x in args]
         out = trace.process_primitive(self, tracers, params)
-        return map(full_lower, out) if self.multiple_results else full_lower(out)
+        return [full_lower(x) for x in out]
 
 
 # -------------------------------------- tracing ---------------------------------------
@@ -75,14 +101,14 @@ class Trace(Generic[TracerType], metaclass=ABCMeta):
         ...
 
     @abstractmethod
-    def lift(self, x: Array) -> TracerType:
+    def lift(self, x: ArrayLike) -> TracerType:
         ...
 
     def full_raise(self, x: ArrayLike) -> TracerType:
         if not isinstance(x, Tracer):
-            if not isinstance(x, NumpyArrayLike):
+            if type(x) not in minjax_types:
                 error_message = (
-                    f"Value {x} does not have a valid JAX type: `{type(x)}`."
+                    f"Value {x} does not have a valid minJAX type: `{type(x)}`."
                 )
                 raise TypeError(error_message)
 
@@ -90,7 +116,8 @@ class Trace(Generic[TracerType], metaclass=ABCMeta):
 
         level = self.main.level
         if x._trace.main is self.main:
-            return x
+            # TODO: check if this cast is correct.
+            return typing.cast(TracerType, x)
 
         if x._trace.main.level < level:
             return self.lift(x)
@@ -109,7 +136,7 @@ class Trace(Generic[TracerType], metaclass=ABCMeta):
         primitive: Primitive,
         tracers: Sequence[TracerType],
         params: dict[str, Any],
-    ) -> Array | Sequence[Array]:
+    ) -> Sequence[TracerType]:
         ...
 
 
@@ -128,22 +155,22 @@ class Tracer(metaclass=ABCMeta):
     def __neg__(self) -> Array:
         return self.aval._neg(self)
 
-    def __add__(self, other: Array) -> Array:
+    def __add__(self, other: ArrayLike) -> Array:
         return self.aval._add(self, other)
 
-    def __radd__(self, other: Array) -> Array:
+    def __radd__(self, other: ArrayLike) -> Array:  # type: ignore
         return self.aval._radd(self, other)
 
-    def __mul__(self, other: Array) -> Array:
+    def __mul__(self, other: ArrayLike) -> Array:
         return self.aval._mul(self, other)
 
-    def __rmul__(self, other: Array) -> Array:
+    def __rmul__(self, other: ArrayLike) -> Array:  # type: ignore
         return self.aval._rmul(self, other)
 
-    def __gt__(self, other: Array) -> Array:
+    def __gt__(self, other: ArrayLike) -> Array:  # type: ignore
         return self.aval._gt(self, other)
 
-    def __lt__(self, other: Array) -> Array:
+    def __lt__(self, other: ArrayLike) -> Array:  # type: ignore
         return self.aval._lt(self, other)
 
     def __bool__(self) -> bool:
@@ -173,7 +200,7 @@ def find_top_trace(xs: Sequence[ArrayLike]) -> Trace:
     return top_main.trace_type(top_main)
 
 
-def full_lower(x: ArrayLike) -> ArrayLike:
+def full_lower(x: Array) -> Array:
     if isinstance(x, Tracer):
         return x.full_lower()
 
@@ -182,20 +209,19 @@ def full_lower(x: ArrayLike) -> ArrayLike:
 
 class EvalTrace(Trace[ArrayLike]):
     def pure(self, x: ArrayLike) -> ArrayLike:
-        return x
+        return np.asarray(x, dtype=dtypes.get_dtype(x))
 
-    def lift(self, x: Array) -> ArrayLike:
-        return x
+    lift = pure
 
     def process_primitive(
         self,
         primitive: Primitive,
         tracers: Sequence[ArrayLike],
         params: dict[str, Any],
-    ) -> Array | Sequence[Array]:
+    ) -> Sequence[ArrayLike]:
         if primitive.impl_rule is None:
             error_message = f"Primitive `{primitive.name}` has no implementation rule."
-            raise Exception(error_message)
+            raise NotImplementedError(error_message)
 
         return primitive.impl_rule(*tracers, **params)
 
@@ -240,52 +266,52 @@ class ShapedArray:
         return len(self.shape)
 
     @staticmethod
-    def _neg(x: Array) -> Array:
+    def _neg(x: ArrayLike) -> Array:
         return lax.neg(x)
 
     @staticmethod
-    def _add(x: Array, y: Array) -> Array:
+    def _add(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.add(x, y)
 
     @staticmethod
-    def _radd(x: Array, y: Array) -> Array:
+    def _radd(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.add(y, x)
 
     @staticmethod
-    def _mul(x: Array, y: Array) -> Array:
+    def _mul(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.mul(x, y)
 
     @staticmethod
-    def _rmul(x: Array, y: Array) -> Array:
+    def _rmul(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.mul(y, x)
 
     @staticmethod
-    def _gt(x: Array, y: Array) -> Array:
+    def _gt(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.greater(x, y)
 
     @staticmethod
-    def _lt(x: Array, y: Array) -> Array:
+    def _lt(x: ArrayLike, y: ArrayLike) -> Array:
         return lax.less(x, y)
 
     @staticmethod
-    def _bool(x: Array) -> bool:
-        del x
-        error_message = "ShapedArray can't be unambiguously converted to bool."
-        raise Exception(error_message)
+    def _bool(x: Tracer) -> bool:
+        return bool(x.aval)
 
     @staticmethod
-    def _nonzero(x: Array) -> bool:
-        del x
-        error_message = "ShapedArray can't be unambiguously converted to bool."
-        raise Exception(error_message)
+    def _nonzero(x: Tracer) -> bool:
+        return bool(x.aval)
 
     def str_short(self) -> str:
         return f"{self.dtype.name}[{','.join(str(d) for d in self.shape)}]"
 
+    def __bool__(self) -> bool:
+        error_message = "ShapedArray can't be unambiguously converted to bool."
+        raise Exception(error_message)
+
     def __hash__(self) -> int:
         return hash((self.shape, self.dtype))
 
-    def __eq__(self, other: "ShapedArray") -> bool:
+    def __eq__(self, other: Any) -> bool:
         return (
             type(self) is type(other)
             and self.shape == other.shape
@@ -299,27 +325,21 @@ class ShapedArray:
 class ConcreteArray(ShapedArray):
     array_abstraction_level = 2
 
-    # TODO: replace `np.ndrray` with `DeviceArray`.
     def __init__(self, val: np.ndarray) -> None:
         self.val = val
         self.shape = val.shape
         self.dtype = val.dtype
 
-    @staticmethod
-    def _bool(x: Array) -> bool:
-        return bool(x.aval.val)
-
-    @staticmethod
-    def _nonzero(x: Array) -> bool:
-        return bool(x.aval.val)
+    def __bool__(self) -> bool:
+        return bool(self.val)
 
 
 def get_aval(x: ArrayLike) -> ShapedArray:
     if isinstance(x, Tracer):
         return x.aval
 
-    if isinstance(x, NumpyArrayLike):
-        return ConcreteArray(np.asarray(x))
+    if type(x) in minjax_types:
+        return ConcreteArray(np.asarray(x, dtype=dtypes.get_dtype(x)))
 
-    error_message = f"Value {x} does not have a valid JAX type: `{type(x)}`."
+    error_message = f"Value {x} does not have a valid minJAX type: `{type(x)}`."
     raise TypeError(error_message)
