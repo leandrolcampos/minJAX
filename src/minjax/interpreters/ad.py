@@ -5,11 +5,11 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from minjax import core, dtypes, utils
+from minjax import core, dtypes, pytrees, utils
 from minjax.typing import Array, ArrayLike
 
 __all__ = [
-    "jvp_v1",
+    "jvp",
     "register_differentiation",
 ]
 
@@ -40,11 +40,24 @@ def register_differentiation(primitive: core.Primitive, jvp_rule: JVPRule) -> No
 
 class JVPTracer(core.Tracer):
     def __init__(
-        self, trace: core.Trace, primal: ArrayLike, tangent: ArrayLike
+        self, trace: core.Trace, primal: ArrayLike, tangent: ArrayLike | None = None
     ) -> None:
         self._trace = trace
-        self.primal = primal
-        self.tangent = tangent
+
+        primal_dtype = dtypes.get_dtype(primal)
+        self.primal = np.asarray(primal, dtype=primal_dtype)
+
+        if np.issubdtype(primal_dtype, np.floating):
+            tangent_dtype = primal_dtype
+        else:
+            tangent_dtype = dtypes.float0
+
+        if tangent is None:
+            self.tangent = utils.zeros_like(self.primal, dtype=tangent_dtype)
+        else:
+            self.tangent = np.broadcast_to(
+                np.asarray(tangent, dtype=tangent_dtype), shape=self.primal.shape
+            )
 
     @property
     def aval(self) -> core.ShapedArray:
@@ -53,7 +66,7 @@ class JVPTracer(core.Tracer):
 
 class JVPTrace(core.Trace[JVPTracer]):
     def pure(self, x: ArrayLike) -> JVPTracer:
-        return JVPTracer(trace=self, primal=x, tangent=utils.zeros_like(x))
+        return JVPTracer(trace=self, primal=x)
 
     lift = pure
 
@@ -77,27 +90,38 @@ class JVPTrace(core.Trace[JVPTracer]):
         ]
 
 
-def jvp_v1(f: Callable, primals: Sequence[ArrayLike], tangents: Sequence[ArrayLike]):
+def jvp_flat(
+    f: Callable, primals: Sequence[ArrayLike], tangents: Sequence[ArrayLike]
+) -> tuple[Sequence[ArrayLike], Sequence[ArrayLike]]:
     with core.new_main(JVPTrace) as main:
         trace = JVPTrace(main)
-        tracers_in: list[JVPTracer] = []
+        tracers_in = [
+            JVPTracer(trace, primal, tangent)
+            for primal, tangent in utils.safe_zip(primals, tangents)
+        ]
 
-        for p, t in utils.safe_zip(primals, tangents):
-            primal_dtype = dtypes.get_dtype(p)
-            if np.issubdtype(primal_dtype, np.floating):
-                tangent_dtype = primal_dtype
-            else:
-                tangent_dtype = dtypes.float0
+        outs = f(*tracers_in)
+        tracers_out = [trace.full_raise(out) for out in outs]
+        primals_out, tangents_out = utils.unzip2(
+            [(tracer_out.primal, tracer_out.tangent) for tracer_out in tracers_out]
+        )
 
-            primal = np.asarray(p, dtype=primal_dtype)
-            tangent = np.broadcast_to(
-                np.asarray(t, dtype=tangent_dtype), shape=primal.shape
-            )
+    return primals_out, tangents_out
 
-            tracers_in.append(JVPTracer(trace, primal, tangent))
 
-        out = f(*tracers_in)
-        tracer_out = trace.full_raise(out)
-        primal_out, tangent_out = tracer_out.primal, tracer_out.tangent
+def jvp(
+    f: Callable, primals: Sequence[Any], tangents: Sequence[Any]
+) -> tuple[Any, Any]:
+    primals_flat, in_tree = pytrees.tree_flatten(primals)
+    tangents_flat, in_tree2 = pytrees.tree_flatten(tangents)
 
-    return primal_out, tangent_out
+    if in_tree != in_tree2:
+        error_message = "The tree structures of `primals` and `tangents` must match."
+        raise TypeError(error_message)
+
+    f, out_tree = pytrees.flatten_fun(f, in_tree)
+    primals_out_flat, tangents_out_flat = jvp_flat(f, primals_flat, tangents_flat)
+    primals_out = pytrees.tree_unflatten(out_tree(), primals_out_flat)
+    tangents_out = pytrees.tree_unflatten(out_tree(), tangents_out_flat)
+
+    return primals_out, tangents_out

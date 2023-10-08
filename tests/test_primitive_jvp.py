@@ -4,7 +4,7 @@ import mpmath as mp  # type: ignore
 import numpy as np
 import pytest
 
-from minjax import dtypes, lax, utils
+from minjax import dtypes, lax, pytrees, utils
 from minjax.interpreters import ad
 
 DEFAULT_SHAPES = ((), (2,), (2, 3))
@@ -46,7 +46,7 @@ def _test_primal(
         args_right = args[(i + 1) :]
 
         minjax_fn = _make_fn(minjax_impl, args_left, args_right, params)
-        out, _ = (np.asarray(out) for out in ad.jvp_v1(minjax_fn, (x,), (ones,)))
+        out, _ = (np.asarray(out) for out in ad.jvp(minjax_fn, (x,), (ones,)))
 
         expected = minjax_fn(x)
 
@@ -76,7 +76,7 @@ def _test_tangent(
         args_right = args[(i + 1) :]
 
         minjax_fn = _make_fn(minjax_impl, args_left, args_right, params)
-        _, out = (np.asarray(out) for out in ad.jvp_v1(minjax_fn, (x,), (ones,)))
+        _, out = (np.asarray(out) for out in ad.jvp(minjax_fn, (x,), (ones,)))
 
         mpmath_fn = _make_fn(mpmath_impl, args_left, args_right, params)
         with mp.workdps(25):  # Set the decimal precision of mpmath.
@@ -263,3 +263,27 @@ def test_reduce_sum(shape, dtype, axis):
 
     _test_primal(lax.reduce_sum, args, params)
     _test_tangent(lax.reduce_sum, mpmath_impl, dtype, args, params)
+
+
+def test_nested():
+    def f(x):
+        y = lax.sin(x) * 2.0
+        z = -y + x
+        return {"hi": z, "there": [x, y]}
+
+    x, xdot = 3.0, 1.0
+    y, ydot = ad.jvp(f, (x,), (xdot,))
+
+    primals_out, _ = pytrees.tree_flatten(y)
+    expected_primals_out = [2.71776, 3.0, 0.28224]
+    for out, expected_out in utils.safe_zip(primals_out, expected_primals_out):
+        assert type(out) is np.ndarray
+        assert out.dtype == np.float32
+        np.testing.assert_allclose(out, expected_out)
+
+    tangents_out, _ = pytrees.tree_flatten(ydot)
+    expected_tangents_out = [2.979985, 1.0, -1.979985]
+    for out, expected_out in utils.safe_zip(tangents_out, expected_tangents_out):
+        assert type(out) is np.ndarray
+        assert out.dtype == np.float32
+        np.testing.assert_allclose(out, expected_out)

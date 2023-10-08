@@ -1,4 +1,4 @@
-"""Utilitity functions for MinJax."""
+"""Utility functions for MinJax."""
 
 from collections.abc import Sequence
 from typing import Any
@@ -34,7 +34,7 @@ def ones_like(
     return np.ones(shape, dtype)
 
 
-def unzip2(pairs: Sequence[tuple[Any, Any]]) -> tuple[Any, Any]:
+def unzip2(pairs: Sequence[tuple[Any, Any]]) -> tuple[list[Any], list[Any]]:
     lst1, lst2 = [], []
     for x, y in pairs:
         lst1.append(x)
